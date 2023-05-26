@@ -46,6 +46,14 @@ impl AccountTransaction {
         }
     }
 
+    pub fn max_fee(&self) -> Fee {
+        match self {
+            AccountTransaction::Declare(declare) => declare.tx().max_fee(),
+            AccountTransaction::DeployAccount(deploy_account) => deploy_account.max_fee,
+            AccountTransaction::Invoke(invoke) => invoke.max_fee(),
+        }
+    }
+
     fn validate_entry_point_selector(&self) -> EntryPointSelector {
         let validate_entry_point_name = match self {
             Self::Declare(_) => constants::VALIDATE_DECLARE_ENTRY_POINT_NAME,
@@ -59,7 +67,7 @@ impl AccountTransaction {
     // `get_tx_info()`.
     fn validate_entrypoint_calldata(&self) -> Calldata {
         match self {
-            Self::Declare(tx) => calldata![tx.tx.class_hash().0],
+            Self::Declare(tx) => calldata![tx.tx().class_hash().0],
             Self::DeployAccount(tx) => {
                 let validate_calldata = concat(vec![
                     vec![tx.class_hash.0, tx.contract_address_salt.0],
@@ -75,7 +83,7 @@ impl AccountTransaction {
     fn get_account_transaction_context(&self) -> AccountTransactionContext {
         match self {
             Self::Declare(tx) => {
-                let tx = &tx.tx;
+                let tx = &tx.tx();
                 AccountTransactionContext {
                     transaction_hash: tx.transaction_hash(),
                     max_fee: tx.max_fee(),
@@ -183,6 +191,47 @@ impl AccountTransaction {
         Ok(Some(validate_call_info))
     }
 
+    fn enforce_fee(&self) -> bool {
+        self.max_fee() != Fee(0)
+    }
+
+    /// Handles nonce, checks balance covers max fee, and (when applicable) runs the validation
+    /// phase.
+    /// Returns the `CallInfo` of the validation phase, if applicable.
+    fn process_validation_state<S: StateReader>(
+        &self,
+        state: &mut TransactionalState<'_, S>,
+        context: &mut ExecutionContext,
+    ) -> TransactionExecutionResult<Option<CallInfo>> {
+        // Handle nonce.
+        Self::handle_nonce(&context.account_tx_context, state)?;
+
+        // Check fee balance.
+        if self.enforce_fee() {
+            let (balance_low, balance_high) = state.get_fee_token_balance(
+                &context.block_context,
+                &context.account_tx_context.sender_address,
+            )?;
+            // TODO(Dori, 1/7/2023): If and when Fees can be more than 128 bit integers, this check
+            //   should be updated.
+            if balance_high == StarkFelt::from(0_u8)
+                && balance_low < StarkFelt::from(context.account_tx_context.max_fee.0)
+            {
+                return Err(TransactionExecutionError::MaxFeeExceedsBalance {
+                    max_fee: context.account_tx_context.max_fee,
+                    balance_low,
+                    balance_high,
+                });
+            }
+        }
+
+        // Validate transaction (if applicable).
+        match &self {
+            Self::Declare(_) | Self::Invoke(_) => self.validate_tx(state, context),
+            Self::DeployAccount(_) => Ok(None),
+        }
+    }
+
     fn charge_fee(
         state: &mut dyn State,
         context: &mut ExecutionContext,
@@ -211,7 +260,7 @@ impl AccountTransaction {
         }
 
         // The least significant 128 bits of the amount transferred.
-        let lsb_amount = StarkFelt::from(actual_fee.0 as u64);
+        let lsb_amount = StarkFelt::from(actual_fee.0);
         // The most significant 128 bits of the amount transferred.
         let msb_amount = StarkFelt::from(0_u8);
 
@@ -233,6 +282,18 @@ impl AccountTransaction {
 
         Ok(fee_transfer_call.execute(state, context)?)
     }
+
+    fn run_execute<S: State>(
+        &self,
+        state: &mut S,
+        context: &mut ExecutionContext,
+    ) -> TransactionExecutionResult<Option<CallInfo>> {
+        match &self {
+            Self::Declare(tx) => tx.run_execute(state, context),
+            Self::DeployAccount(tx) => tx.run_execute(state, context),
+            Self::Invoke(tx) => tx.run_execute(state, context),
+        }
+    }
 }
 
 impl<S: StateReader> ExecutableTransaction<S> for AccountTransaction {
@@ -243,35 +304,17 @@ impl<S: StateReader> ExecutableTransaction<S> for AccountTransaction {
     ) -> TransactionExecutionResult<TransactionExecutionInfo> {
         let account_tx_context = self.get_account_transaction_context();
         self.verify_tx_version(account_tx_context.version)?;
-        Self::handle_nonce(&account_tx_context, state)?;
+        let mut context = ExecutionContext::new(block_context.clone(), account_tx_context);
+
+        // Pre-process the nonce / fee check / validation state changes.
+        let early_validate_call_info = self.process_validation_state(state, &mut context)?;
 
         // Handle transaction-type specific execution.
-        let validate_call_info: Option<CallInfo>;
-        let execute_call_info: Option<CallInfo>;
-        let tx_type = self.tx_type();
-        let mut context = ExecutionContext::new(block_context.clone(), account_tx_context);
-        match &self {
-            Self::Declare(tx) => {
-                // Validate.
-                validate_call_info = self.validate_tx(state, &mut context)?;
-
-                // Execute.
-                execute_call_info = tx.run_execute(state, &mut context)?;
-            }
-            Self::DeployAccount(tx) => {
-                // Execute the constructor of the deployed class.
-                execute_call_info = tx.run_execute(state, &mut context)?;
-
-                // Validate.
-                validate_call_info = self.validate_tx(state, &mut context)?;
-            }
-            Self::Invoke(tx) => {
-                // Validate.
-                validate_call_info = self.validate_tx(state, &mut context)?;
-
-                // Execute.
-                execute_call_info = tx.run_execute(state, &mut context)?;
-            }
+        // The validation phase in a `DeployAccount` transaction happens after execution.
+        let execute_call_info = self.run_execute(state, &mut context)?;
+        let validate_call_info = match &self {
+            Self::DeployAccount(_) => self.validate_tx(state, &mut context)?,
+            Self::Declare(_) | Self::Invoke(_) => early_validate_call_info,
         };
 
         // Handle fee.
@@ -282,7 +325,7 @@ impl<S: StateReader> ExecutableTransaction<S> for AccountTransaction {
         let actual_resources = calculate_tx_resources(
             context.resources,
             &non_optional_call_infos,
-            tx_type,
+            self.tx_type(),
             state,
             None,
         )?;

@@ -11,8 +11,9 @@ use starknet_api::transaction::{
 };
 
 use self::hint_processor::{
-    execute_inner_call, execute_library_call, felt_to_bool, read_call_params, read_calldata,
-    read_felt_array, SyscallExecutionError, SyscallHintProcessor,
+    create_retdata_segment, execute_inner_call, execute_library_call, felt_to_bool,
+    read_call_params, read_calldata, read_felt_array, write_segment, SyscallExecutionError,
+    SyscallHintProcessor,
 };
 use crate::execution::deprecated_syscalls::DeprecatedSyscallSelector;
 use crate::execution::entry_point::{
@@ -116,9 +117,7 @@ pub struct SingleSegmentResponse {
 
 impl SyscallResponse for SingleSegmentResponse {
     fn write(self, vm: &mut VirtualMachine, ptr: &mut Relocatable) -> WriteResponseResult {
-        write_maybe_relocatable(vm, ptr, self.segment.start_ptr)?;
-        write_maybe_relocatable(vm, ptr, (self.segment.start_ptr + self.segment.length)?)?;
-        Ok(())
+        write_segment(vm, ptr, self.segment)
     }
 }
 
@@ -189,26 +188,22 @@ impl SyscallRequest for DeployRequest {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct DeployResponse {
     pub contract_address: ContractAddress,
+    pub constructor_retdata: ReadOnlySegment,
 }
 
 impl SyscallResponse for DeployResponse {
-    // The Cairo struct contains: `contract_address`, `constructor_retdata_size`,
-    // `constructor_retdata`.
-    // Nonempty constructor retdata is currently not supported.
     fn write(self, vm: &mut VirtualMachine, ptr: &mut Relocatable) -> WriteResponseResult {
         write_felt(vm, ptr, *self.contract_address.0.key())?;
-        write_maybe_relocatable(vm, ptr, 0)?;
-        write_maybe_relocatable(vm, ptr, 0)?;
-        Ok(())
+        write_segment(vm, ptr, self.constructor_retdata)
     }
 }
 
 pub fn deploy(
     request: DeployRequest,
-    _vm: &mut VirtualMachine,
+    vm: &mut VirtualMachine,
     syscall_handler: &mut SyscallHintProcessor<'_>,
 ) -> SyscallResult<DeployResponse> {
     let deployer_address = syscall_handler.storage_address();
@@ -233,9 +228,13 @@ pub fn deploy(
         request.constructor_calldata,
         is_deploy_account_tx,
     )?;
+
+    let constructor_retdata =
+        create_retdata_segment(vm, syscall_handler, &call_info.execution.retdata.0)?;
+
     syscall_handler.inner_calls.push(call_info);
 
-    Ok(DeployResponse { contract_address: deployed_contract_address })
+    Ok(DeployResponse { contract_address: deployed_contract_address, constructor_retdata })
 }
 
 // EmitEvent syscall.
@@ -272,29 +271,29 @@ pub fn emit_event(
     Ok(EmitEventResponse {})
 }
 
-// GetTxInfo syscall.
+// GetExecutionInfo syscall.
 
-type GetTxInfoRequest = EmptyRequest;
+type GetExecutionInfoRequest = EmptyRequest;
 
 #[derive(Debug, Eq, PartialEq)]
-pub struct GetTxInfoResponse {
-    pub tx_info_start_ptr: Relocatable,
+pub struct GetExecutionInfoResponse {
+    pub execution_info_ptr: Relocatable,
 }
 
-impl SyscallResponse for GetTxInfoResponse {
+impl SyscallResponse for GetExecutionInfoResponse {
     fn write(self, vm: &mut VirtualMachine, ptr: &mut Relocatable) -> WriteResponseResult {
-        write_maybe_relocatable(vm, ptr, self.tx_info_start_ptr)?;
+        write_maybe_relocatable(vm, ptr, self.execution_info_ptr)?;
         Ok(())
     }
 }
-pub fn get_tx_info(
-    _request: GetTxInfoRequest,
+pub fn get_execution_info(
+    _request: GetExecutionInfoRequest,
     vm: &mut VirtualMachine,
     syscall_handler: &mut SyscallHintProcessor<'_>,
-) -> SyscallResult<GetTxInfoResponse> {
-    let tx_info_start_ptr = syscall_handler.get_or_allocate_tx_info_start_ptr(vm)?;
+) -> SyscallResult<GetExecutionInfoResponse> {
+    let execution_info_ptr = syscall_handler.get_or_allocate_execution_info_segment(vm)?;
 
-    Ok(GetTxInfoResponse { tx_info_start_ptr })
+    Ok(GetExecutionInfoResponse { execution_info_ptr })
 }
 
 // LibraryCall syscall.

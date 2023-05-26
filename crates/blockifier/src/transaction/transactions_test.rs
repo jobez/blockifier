@@ -19,7 +19,7 @@ use starknet_api::{calldata, patricia_key, stark_felt};
 use crate::abi::abi_utils::{get_storage_var_address, selector_from_name};
 use crate::abi::constants as abi_constants;
 use crate::block_context::BlockContext;
-use crate::execution::contract_class::ContractClass;
+use crate::execution::contract_class::{ContractClass, ContractClassV0};
 use crate::execution::entry_point::{
     CallEntryPoint, CallExecution, CallInfo, CallType, OrderedEvent, Retdata,
 };
@@ -30,13 +30,13 @@ use crate::state::cached_state::CachedState;
 use crate::state::errors::StateError;
 use crate::state::state_api::{State, StateReader};
 use crate::test_utils::{
-    get_contract_class_v0, test_erc20_account_balance_key, test_erc20_faulty_account_balance_key,
+    test_erc20_account_balance_key, test_erc20_faulty_account_balance_key,
     test_erc20_sequencer_balance_key, validate_tx_execution_info, DictStateReader,
     ACCOUNT_CONTRACT_PATH, BALANCE, ERC20_CONTRACT_PATH, MAX_FEE, TEST_ACCOUNT_CONTRACT_ADDRESS,
     TEST_ACCOUNT_CONTRACT_CLASS_HASH, TEST_CLASS_HASH, TEST_CONTRACT_ADDRESS, TEST_CONTRACT_PATH,
-    TEST_EMPTY_CONTRACT_CLASS_HASH, TEST_EMPTY_CONTRACT_PATH, TEST_ERC20_CONTRACT_CLASS_HASH,
-    TEST_FAULTY_ACCOUNT_CONTRACT_ADDRESS, TEST_FAULTY_ACCOUNT_CONTRACT_CLASS_HASH,
-    TEST_FAULTY_ACCOUNT_CONTRACT_PATH,
+    TEST_EMPTY_CONTRACT_CLASS_HASH, TEST_EMPTY_CONTRACT_PATH, TEST_ERC20_CONTRACT_ADDRESS,
+    TEST_ERC20_CONTRACT_CLASS_HASH, TEST_FAULTY_ACCOUNT_CONTRACT_ADDRESS,
+    TEST_FAULTY_ACCOUNT_CONTRACT_CLASS_HASH, TEST_FAULTY_ACCOUNT_CONTRACT_PATH,
 };
 use crate::transaction::account_transaction::AccountTransaction;
 use crate::transaction::constants;
@@ -55,7 +55,7 @@ fn create_account_tx_test_state(
     account_address: &str,
     account_path: &str,
     erc20_account_balance_key: StorageKey,
-    initial_account_balance: u64,
+    initial_account_balance: u128,
 ) -> CachedState<DictStateReader> {
     let block_context = BlockContext::create_for_testing();
 
@@ -63,9 +63,9 @@ fn create_account_tx_test_state(
     let test_account_class_hash = ClassHash(stark_felt!(account_class_hash));
     let test_erc20_class_hash = ClassHash(stark_felt!(TEST_ERC20_CONTRACT_CLASS_HASH));
     let class_hash_to_class = HashMap::from([
-        (test_account_class_hash, get_contract_class_v0(account_path).into()),
-        (test_contract_class_hash, get_contract_class_v0(TEST_CONTRACT_PATH).into()),
-        (test_erc20_class_hash, get_contract_class_v0(ERC20_CONTRACT_PATH).into()),
+        (test_account_class_hash, ContractClassV0::from_file(account_path).into()),
+        (test_contract_class_hash, ContractClassV0::from_file(TEST_CONTRACT_PATH).into()),
+        (test_erc20_class_hash, ContractClassV0::from_file(ERC20_CONTRACT_PATH).into()),
     ]);
     let test_contract_address = ContractAddress(patricia_key!(TEST_CONTRACT_ADDRESS));
     // A random address that is unlikely to equal the result of the calculation of a contract
@@ -77,10 +77,13 @@ fn create_account_tx_test_state(
         (test_account_address, test_account_class_hash),
         (test_erc20_address, test_erc20_class_hash),
     ]);
-    let storage_view = HashMap::from([(
-        (test_erc20_address, erc20_account_balance_key),
-        stark_felt!(initial_account_balance),
-    )]);
+    let minter_var_address = get_storage_var_address("permitted_minter", &[])
+        .expect("Failed to get permitted_minter storage address.");
+    let storage_view = HashMap::from([
+        ((test_erc20_address, erc20_account_balance_key), stark_felt!(initial_account_balance)),
+        // Give the account mint permission.
+        ((test_erc20_address, minter_var_address), *test_account_address.0.key()),
+    ]);
     CachedState::new(DictStateReader {
         address_to_class_hash,
         class_hash_to_class,
@@ -134,7 +137,7 @@ fn expected_fee_transfer_call_info(
     let expected_fee_token_class_hash = ClassHash(stark_felt!(TEST_ERC20_CONTRACT_CLASS_HASH));
     let expected_sequencer_address = *block_context.sequencer_address.0.key();
     // The least significant 128 bits of the expected amount transferred.
-    let lsb_expected_amount = stark_felt!(actual_fee.0 as u64);
+    let lsb_expected_amount = stark_felt!(actual_fee.0);
     // The most significant 128 bits of the expected amount transferred.
     let msb_expected_amount = stark_felt!(0_u8);
     let storage_address = block_context.fee_token_address;
@@ -183,7 +186,7 @@ fn validate_final_balances(
     block_context: &BlockContext,
     expected_sequencer_balance: StarkFelt,
     erc20_account_balance_key: StorageKey,
-    expected_account_balance: u64,
+    expected_account_balance: u128,
 ) {
     let account_balance =
         state.get_storage_at(block_context.fee_token_address, erc20_account_balance_key).unwrap();
@@ -209,7 +212,7 @@ fn invoke_tx() -> InvokeTransactionV1 {
     crate::test_utils::invoke_tx(
         execute_calldata,
         ContractAddress(patricia_key!(TEST_ACCOUNT_CONTRACT_ADDRESS)),
-        Fee(u128::from(MAX_FEE)),
+        Fee(MAX_FEE),
         None,
     )
 }
@@ -337,8 +340,8 @@ fn test_invoke_tx() {
     assert_eq!(nonce_from_state, Nonce(stark_felt!(1_u8)));
 
     // Test final balances.
-    let expected_sequencer_balance = stark_felt!(expected_actual_fee.0 as u64);
-    let expected_account_balance = BALANCE - expected_actual_fee.0 as u64;
+    let expected_sequencer_balance = stark_felt!(expected_actual_fee.0);
+    let expected_account_balance = BALANCE - expected_actual_fee.0;
     validate_final_balances(
         state,
         block_context,
@@ -346,6 +349,88 @@ fn test_invoke_tx() {
         test_erc20_account_balance_key(),
         expected_account_balance,
     );
+}
+
+#[test]
+fn test_state_get_fee_token_balance() {
+    let state = &mut create_state_with_trivial_validation_account();
+    let block_context = &BlockContext::create_for_account_testing();
+    let (mint_high, mint_low) = (stark_felt!(54_u8), stark_felt!(39_u8));
+    let recipient = stark_felt!(10_u8);
+
+    // Mint some tokens.
+    let entry_point_selector = selector_from_name("permissionedMint");
+    let execute_calldata = calldata![
+        stark_felt!(TEST_ERC20_CONTRACT_ADDRESS), // Contract address.
+        entry_point_selector.0,                   // EP selector.
+        stark_felt!(3_u8),                        // Calldata length.
+        recipient,
+        mint_low,
+        mint_high
+    ];
+    let mint_tx = crate::test_utils::invoke_tx(
+        execute_calldata,
+        ContractAddress(patricia_key!(TEST_ACCOUNT_CONTRACT_ADDRESS)),
+        Fee(MAX_FEE),
+        None,
+    );
+    AccountTransaction::Invoke(InvokeTransaction::V1(mint_tx))
+        .execute(state, block_context)
+        .unwrap();
+
+    // Get balance from state, and validate.
+    let (low, high) = state
+        .get_fee_token_balance(block_context, &ContractAddress(patricia_key!(recipient)))
+        .unwrap();
+
+    assert_eq!(low, mint_low);
+    assert_eq!(high, mint_high);
+}
+
+fn assert_failure_if_max_fee_exceeds_balance(
+    state: &mut CachedState<DictStateReader>,
+    block_context: &BlockContext,
+    invalid_tx: AccountTransaction,
+) {
+    let sent_max_fee = invalid_tx.max_fee();
+
+    // Test error.
+    assert_matches!(
+        invalid_tx.execute(state, block_context).unwrap_err(),
+        TransactionExecutionError::MaxFeeExceedsBalance{ max_fee, .. }
+        if max_fee == sent_max_fee
+    );
+}
+
+#[test]
+fn test_max_fee_exceeds_balance() {
+    let state = &mut create_state_with_trivial_validation_account();
+    let block_context = &BlockContext::create_for_account_testing();
+    let invalid_max_fee = Fee(BALANCE + 1);
+
+    // Invoke.
+    let invalid_tx = AccountTransaction::Invoke(InvokeTransaction::V1(InvokeTransactionV1 {
+        max_fee: invalid_max_fee,
+        ..invoke_tx()
+    }));
+    assert_failure_if_max_fee_exceeds_balance(state, block_context, invalid_tx);
+
+    // Deploy.
+    let invalid_tx = AccountTransaction::DeployAccount(DeployAccountTransaction {
+        max_fee: invalid_max_fee,
+        ..deploy_account_tx(TEST_ACCOUNT_CONTRACT_CLASS_HASH, None, None)
+    });
+    assert_failure_if_max_fee_exceeds_balance(state, block_context, invalid_tx);
+
+    // Declare.
+    let invalid_tx = AccountTransaction::Declare(DeclareTransaction {
+        tx: starknet_api::transaction::DeclareTransaction::V1(DeclareTransactionV0V1 {
+            max_fee: invalid_max_fee,
+            ..declare_tx(TEST_EMPTY_CONTRACT_CLASS_HASH, TEST_ACCOUNT_CONTRACT_ADDRESS, None)
+        }),
+        contract_class: ContractClass::V0(ContractClassV0::from_file(TEST_EMPTY_CONTRACT_PATH)),
+    });
+    assert_failure_if_max_fee_exceeds_balance(state, block_context, invalid_tx);
 }
 
 #[test]
@@ -397,7 +482,7 @@ fn declare_tx(
     crate::test_utils::declare_tx(
         class_hash,
         ContractAddress(patricia_key!(sender_address)),
-        Fee(u128::from(MAX_FEE)),
+        Fee(MAX_FEE),
         signature,
     )
 }
@@ -414,7 +499,7 @@ fn test_declare_tx() {
     let sender_address = declare_tx.sender_address;
     let class_hash = declare_tx.class_hash;
 
-    let contract_class = ContractClass::V0(get_contract_class_v0(TEST_EMPTY_CONTRACT_PATH));
+    let contract_class = ContractClass::V0(ContractClassV0::from_file(TEST_EMPTY_CONTRACT_PATH));
     let account_tx = AccountTransaction::Declare(DeclareTransaction {
         tx: starknet_api::transaction::DeclareTransaction::V1(declare_tx),
         contract_class: contract_class.clone(),
@@ -476,8 +561,8 @@ fn test_declare_tx() {
     assert_eq!(nonce_from_state, Nonce(stark_felt!(1_u8)));
 
     // Test final balances.
-    let expected_sequencer_balance = stark_felt!(expected_actual_fee.0 as u64);
-    let expected_account_balance = BALANCE - expected_actual_fee.0 as u64;
+    let expected_sequencer_balance = stark_felt!(expected_actual_fee.0);
+    let expected_account_balance = BALANCE - expected_actual_fee.0;
     validate_final_balances(
         state,
         block_context,
@@ -498,7 +583,7 @@ fn deploy_account_tx(
 ) -> DeployAccountTransaction {
     crate::test_utils::deploy_account_tx(
         account_class_hash,
-        Fee(u128::from(MAX_FEE)),
+        Fee(MAX_FEE),
         constructor_calldata,
         signature,
     )
@@ -592,8 +677,8 @@ fn test_deploy_account_tx() {
     assert_eq!(nonce_from_state, Nonce(stark_felt!(1_u8)));
 
     // Test final balances.
-    let expected_sequencer_balance = stark_felt!(expected_actual_fee.0 as u64);
-    let expected_account_balance = BALANCE - expected_actual_fee.0 as u64;
+    let expected_sequencer_balance = stark_felt!(expected_actual_fee.0);
+    let expected_account_balance = BALANCE - expected_actual_fee.0;
     validate_final_balances(
         state,
         block_context,
@@ -635,7 +720,8 @@ fn create_account_tx_for_validate_test(
 
     match tx_type {
         TransactionType::Declare => {
-            let contract_class = get_contract_class_v0(TEST_FAULTY_ACCOUNT_CONTRACT_PATH).into();
+            let contract_class =
+                ContractClassV0::from_file(TEST_FAULTY_ACCOUNT_CONTRACT_PATH).into();
             let declare_tx = crate::test_utils::declare_tx(
                 TEST_ACCOUNT_CONTRACT_CLASS_HASH,
                 ContractAddress(patricia_key!(TEST_FAULTY_ACCOUNT_CONTRACT_ADDRESS)),

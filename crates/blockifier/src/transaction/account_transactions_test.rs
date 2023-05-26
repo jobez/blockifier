@@ -10,12 +10,13 @@ use starknet_api::{calldata, stark_felt};
 
 use crate::abi::abi_utils::{get_storage_var_address, selector_from_name};
 use crate::block_context::BlockContext;
+use crate::execution::contract_class::ContractClassV0;
 use crate::state::cached_state::CachedState;
 use crate::state::state_api::State;
 use crate::test_utils::{
-    declare_tx, deploy_account_tx, get_contract_class_v0, invoke_tx, DictStateReader,
-    ACCOUNT_CONTRACT_PATH, BALANCE, ERC20_CONTRACT_PATH, MAX_FEE, TEST_ACCOUNT_CONTRACT_CLASS_HASH,
-    TEST_CLASS_HASH, TEST_CONTRACT_PATH, TEST_ERC20_CONTRACT_CLASS_HASH,
+    declare_tx, deploy_account_tx, invoke_tx, DictStateReader, ACCOUNT_CONTRACT_PATH, BALANCE,
+    ERC20_CONTRACT_PATH, MAX_FEE, TEST_ACCOUNT_CONTRACT_CLASS_HASH, TEST_CLASS_HASH,
+    TEST_CONTRACT_PATH, TEST_ERC20_CONTRACT_CLASS_HASH,
 };
 use crate::transaction::account_transaction::AccountTransaction;
 use crate::transaction::transactions::{DeclareTransaction, ExecutableTransaction};
@@ -27,8 +28,8 @@ fn create_state() -> CachedState<DictStateReader> {
     let test_account_class_hash = ClassHash(stark_felt!(TEST_ACCOUNT_CONTRACT_CLASS_HASH));
     let test_erc20_class_hash = ClassHash(stark_felt!(TEST_ERC20_CONTRACT_CLASS_HASH));
     let class_hash_to_class = HashMap::from([
-        (test_account_class_hash, get_contract_class_v0(ACCOUNT_CONTRACT_PATH).into()),
-        (test_erc20_class_hash, get_contract_class_v0(ERC20_CONTRACT_PATH).into()),
+        (test_account_class_hash, ContractClassV0::from_file(ACCOUNT_CONTRACT_PATH).into()),
+        (test_erc20_class_hash, ContractClassV0::from_file(ERC20_CONTRACT_PATH).into()),
     ]);
     // Deploy the erc20 contract.
     let test_erc20_address = block_context.fee_token_address;
@@ -42,10 +43,28 @@ fn create_state() -> CachedState<DictStateReader> {
 }
 
 #[test]
+fn test_fee_enforcement() {
+    let state = &mut create_state();
+    let block_context = &BlockContext::create_for_account_testing();
+
+    for max_fee_value in 0..2 {
+        let max_fee = Fee(max_fee_value);
+
+        let deploy_account_tx =
+            deploy_account_tx(TEST_ACCOUNT_CONTRACT_CLASS_HASH, max_fee, None, None);
+
+        let account_tx = AccountTransaction::DeployAccount(deploy_account_tx);
+        let enforce_fee = account_tx.enforce_fee();
+        let result = account_tx.execute(state, block_context);
+        assert_eq!(result.is_err(), enforce_fee);
+    }
+}
+
+#[test]
 fn test_account_flow_test() {
     let state = &mut create_state();
     let block_context = &BlockContext::create_for_account_testing();
-    let max_fee = Fee(u128::from(MAX_FEE));
+    let max_fee = Fee(MAX_FEE);
 
     // Deploy an account contract.
     let deploy_account_tx =
@@ -59,22 +78,25 @@ fn test_account_flow_test() {
     state.set_storage_at(
         block_context.fee_token_address,
         deployed_account_balance_key,
-        stark_felt!(Fee(u128::from(BALANCE)).0 as u64),
+        stark_felt!(BALANCE),
     );
 
     let account_tx = AccountTransaction::DeployAccount(deploy_account_tx);
     account_tx.execute(state, block_context).unwrap();
 
     // Declare a contract.
-    let contract_class = get_contract_class_v0(TEST_CONTRACT_PATH).into();
+    let contract_class = ContractClassV0::from_file(TEST_CONTRACT_PATH).into();
     let declare_tx = declare_tx(TEST_CLASS_HASH, deployed_account_address, max_fee, None);
-    let account_tx = AccountTransaction::Declare(DeclareTransaction {
-        tx: starknet_api::transaction::DeclareTransaction::V1(DeclareTransactionV0V1 {
-            nonce: Nonce(stark_felt!(1_u8)),
-            ..declare_tx
-        }),
-        contract_class,
-    });
+    let account_tx = AccountTransaction::Declare(
+        DeclareTransaction::new(
+            starknet_api::transaction::DeclareTransaction::V1(DeclareTransactionV0V1 {
+                nonce: Nonce(stark_felt!(1_u8)),
+                ..declare_tx
+            }),
+            contract_class,
+        )
+        .unwrap(),
+    );
     account_tx.execute(state, block_context).unwrap();
 
     // Deploy a contract using syscall deploy.

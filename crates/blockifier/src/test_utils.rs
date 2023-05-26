@@ -3,7 +3,6 @@ use std::fs;
 use std::iter::zip;
 use std::path::PathBuf;
 
-use cairo_lang_starknet::casm_contract_class::CasmContractClass;
 use starknet_api::block::{BlockNumber, BlockTimestamp};
 use starknet_api::core::{
     calculate_contract_address, ChainId, ClassHash, CompiledClassHash, ContractAddress,
@@ -27,7 +26,7 @@ use crate::execution::entry_point::{
     CallEntryPoint, CallExecution, CallInfo, CallType, EntryPointExecutionResult, ExecutionContext,
     Retdata,
 };
-use crate::state::cached_state::{CachedState, ContractStorageKey};
+use crate::state::cached_state::{CachedState, ContractClassMapping, ContractStorageKey};
 use crate::state::errors::StateError;
 use crate::state::state_api::{State, StateReader, StateResult};
 use crate::transaction::objects::{AccountTransactionContext, TransactionExecutionInfo};
@@ -62,6 +61,8 @@ pub const SECURITY_TEST_CONTRACT_PATH: &str =
     "./feature_contracts/cairo0/compiled/security_tests_contract_compiled.json";
 pub const TEST_EMPTY_CONTRACT_PATH: &str =
     "./feature_contracts/cairo0/compiled/empty_contract_compiled.json";
+pub const TEST_EMPTY_CONTRACT_CAIRO1_PATH: &str =
+    "./feature_contracts/cairo1/compiled/empty_contract.casm.json";
 pub const TEST_FAULTY_ACCOUNT_CONTRACT_PATH: &str =
     "./feature_contracts/cairo0/compiled/account_faulty_compiled.json";
 pub const ERC20_CONTRACT_PATH: &str =
@@ -81,10 +82,10 @@ pub fn test_erc20_faulty_account_balance_key() -> StorageKey {
 }
 
 // The max_fee used for txs in this test.
-pub const MAX_FEE: u64 = 1000000 * 100000000000; // 1000000 * min_gas_price.
+pub const MAX_FEE: u128 = 1000000 * 100000000000; // 1000000 * min_gas_price.
 
 // The amount of test-token allocated to the account in this test.
-pub const BALANCE: u64 = 10 * MAX_FEE;
+pub const BALANCE: u128 = 10 * MAX_FEE;
 
 pub const DEFAULT_GAS_PRICE: u128 = 100 * u128::pow(10, 9); // Given in units of wei.
 
@@ -146,17 +147,9 @@ pub fn pad_address_to_64(address: &str) -> String {
     String::from("0x") + format!("{trimmed_address:0>64}").as_str()
 }
 
-pub fn get_contract_class_v1(contract_path: &str) -> ContractClassV1 {
+pub fn get_raw_contract_class(contract_path: &str) -> String {
     let path: PathBuf = [env!("CARGO_MANIFEST_DIR"), contract_path].iter().collect();
-    let raw_contract_class = fs::read_to_string(path).unwrap();
-    let casm_contract_class: CasmContractClass = serde_json::from_str(&raw_contract_class).unwrap();
-    casm_contract_class.try_into().unwrap()
-}
-
-pub fn get_contract_class_v0(contract_path: &str) -> ContractClassV0 {
-    let path: PathBuf = [env!("CARGO_MANIFEST_DIR"), contract_path].iter().collect();
-    let raw_contract_class = fs::read_to_string(path).unwrap();
-    serde_json::from_str(&raw_contract_class).unwrap()
+    fs::read_to_string(path).unwrap()
 }
 
 pub fn get_deprecated_contract_class(contract_path: &str) -> DeprecatedContractClass {
@@ -174,7 +167,7 @@ pub fn get_deprecated_contract_class(contract_path: &str) -> DeprecatedContractC
 }
 
 pub fn get_test_contract_class() -> ContractClass {
-    get_contract_class_v0(TEST_CONTRACT_PATH).into()
+    ContractClassV0::from_file(TEST_CONTRACT_PATH).into()
 }
 
 pub fn trivial_external_entry_point() -> CallEntryPoint {
@@ -198,14 +191,38 @@ pub fn trivial_external_entry_point_security_test() -> CallEntryPoint {
     }
 }
 
-pub fn create_test_state() -> CachedState<DictStateReader> {
-    let class_hash_to_class = HashMap::from([
-        (ClassHash(stark_felt!(TEST_CLASS_HASH)), get_contract_class_v0(TEST_CONTRACT_PATH).into()),
+fn get_class_hash_to_v0_class_mapping() -> ContractClassMapping {
+    HashMap::from([
+        (
+            ClassHash(stark_felt!(TEST_CLASS_HASH)),
+            ContractClassV0::from_file(TEST_CONTRACT_PATH).into(),
+        ),
         (
             ClassHash(stark_felt!(SECURITY_TEST_CLASS_HASH)),
-            get_contract_class_v0(SECURITY_TEST_CONTRACT_PATH).into(),
+            ContractClassV0::from_file(SECURITY_TEST_CONTRACT_PATH).into(),
         ),
-    ]);
+        (
+            ClassHash(stark_felt!(TEST_EMPTY_CONTRACT_CLASS_HASH)),
+            ContractClassV0::from_file(TEST_EMPTY_CONTRACT_PATH).into(),
+        ),
+    ])
+}
+
+fn get_class_hash_to_v1_class_mapping() -> ContractClassMapping {
+    HashMap::from([
+        (
+            ClassHash(stark_felt!(TEST_CLASS_HASH)),
+            ContractClassV1::from_file(TEST_CONTRACT_CAIRO1_PATH).into(),
+        ),
+        (
+            ClassHash(stark_felt!(TEST_EMPTY_CONTRACT_CLASS_HASH)),
+            ContractClassV1::from_file(TEST_EMPTY_CONTRACT_CAIRO1_PATH).into(),
+        ),
+    ])
+}
+
+pub fn deprecated_create_test_state() -> CachedState<DictStateReader> {
+    let class_hash_to_class = get_class_hash_to_v0_class_mapping();
 
     // Two instances of a test contract and one instance of another (different) test contract.
     let address_to_class_hash = HashMap::from([
@@ -230,11 +247,8 @@ pub fn create_test_state() -> CachedState<DictStateReader> {
     })
 }
 
-pub fn create_test_cairo1_state() -> CachedState<DictStateReader> {
-    let class_hash_to_class = HashMap::from([(
-        ClassHash(stark_felt!(TEST_CLASS_HASH)),
-        get_contract_class_v1(TEST_CONTRACT_CAIRO1_PATH).into(),
-    )]);
+pub fn create_test_state() -> CachedState<DictStateReader> {
+    let class_hash_to_class = get_class_hash_to_v1_class_mapping();
 
     // Two instances of a test contract and one instance of another (different) test contract.
     let address_to_class_hash = HashMap::from([
@@ -255,9 +269,10 @@ pub fn create_test_cairo1_state() -> CachedState<DictStateReader> {
     })
 }
 
-pub fn create_deploy_test_state() -> CachedState<DictStateReader> {
+fn create_deploy_test_state_from_classes(
+    class_hash_to_class: ContractClassMapping,
+) -> CachedState<DictStateReader> {
     let class_hash = ClassHash(stark_felt!(TEST_CLASS_HASH));
-    let empty_contract_class_hash = ClassHash(stark_felt!(TEST_EMPTY_CONTRACT_CLASS_HASH));
     let contract_address = ContractAddress(patricia_key!(TEST_CONTRACT_ADDRESS));
     let another_contract_address = calculate_contract_address(
         ContractAddressSalt::default(),
@@ -269,10 +284,6 @@ pub fn create_deploy_test_state() -> CachedState<DictStateReader> {
         ContractAddress(patricia_key!(TEST_CONTRACT_ADDRESS)),
     )
     .unwrap();
-    let class_hash_to_class = HashMap::from([
-        (class_hash, get_contract_class_v0(TEST_CONTRACT_PATH).into()),
-        (empty_contract_class_hash, get_contract_class_v0(TEST_EMPTY_CONTRACT_PATH).into()),
-    ]);
     let address_to_class_hash =
         HashMap::from([(contract_address, class_hash), (another_contract_address, class_hash)]);
 
@@ -281,6 +292,16 @@ pub fn create_deploy_test_state() -> CachedState<DictStateReader> {
         address_to_class_hash,
         ..Default::default()
     })
+}
+
+pub fn deprecated_create_deploy_test_state() -> CachedState<DictStateReader> {
+    let class_hash_to_class = get_class_hash_to_v0_class_mapping();
+    create_deploy_test_state_from_classes(class_hash_to_class)
+}
+
+pub fn create_deploy_test_state() -> CachedState<DictStateReader> {
+    let class_hash_to_class = get_class_hash_to_v1_class_mapping();
+    create_deploy_test_state_from_classes(class_hash_to_class)
 }
 
 impl CallEntryPoint {
@@ -424,4 +445,18 @@ pub fn validate_tx_execution_info(
     compare_optional_call_infos(actual.fee_transfer_call_info, expected.fee_transfer_call_info);
     assert_eq!(actual.actual_fee, expected.actual_fee);
     assert_eq!(actual.actual_resources, expected.actual_resources);
+}
+
+impl ContractClassV0 {
+    pub fn from_file(contract_path: &str) -> ContractClassV0 {
+        let raw_contract_class = get_raw_contract_class(contract_path);
+        Self::try_from_json_string(&raw_contract_class).unwrap()
+    }
+}
+
+impl ContractClassV1 {
+    pub fn from_file(contract_path: &str) -> ContractClassV1 {
+        let raw_contract_class = get_raw_contract_class(contract_path);
+        Self::try_from_json_string(&raw_contract_class).unwrap()
+    }
 }

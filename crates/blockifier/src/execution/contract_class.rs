@@ -32,6 +32,7 @@ pub enum ContractClass {
     V0(ContractClassV0),
     V1(ContractClassV1),
 }
+
 impl ContractClass {
     pub fn constructor_selector(&self) -> Option<EntryPointSelector> {
         match self {
@@ -40,11 +41,13 @@ impl ContractClass {
         }
     }
 }
+
 impl From<ContractClassV0> for ContractClass {
     fn from(class: ContractClassV0) -> Self {
         Self::V0(class)
     }
 }
+
 impl From<ContractClassV1> for ContractClass {
     fn from(class: ContractClassV1) -> Self {
         Self::V1(class)
@@ -61,9 +64,15 @@ impl Deref for ContractClassV0 {
         &self.0
     }
 }
+
 impl ContractClassV0 {
     fn constructor_selector(&self) -> Option<EntryPointSelector> {
         Some(self.0.entry_points_by_type[&EntryPointType::Constructor].first()?.selector)
+    }
+
+    pub fn try_from_json_string(raw_contract_class: &str) -> Result<ContractClassV0, ProgramError> {
+        let contract_class: ContractClassV0Inner = serde_json::from_str(raw_contract_class)?;
+        Ok(ContractClassV0(Arc::new(contract_class)))
     }
 }
 
@@ -73,6 +82,7 @@ pub struct ContractClassV0Inner {
     pub program: Program,
     pub entry_points_by_type: HashMap<EntryPointType, Vec<EntryPoint>>,
 }
+
 impl TryFrom<DeprecatedContractClass> for ContractClassV0 {
     type Error = ProgramError;
 
@@ -94,6 +104,7 @@ impl Deref for ContractClassV1 {
         &self.0
     }
 }
+
 impl ContractClassV1 {
     fn constructor_selector(&self) -> Option<EntryPointSelector> {
         Some(self.0.entry_points_by_type[&EntryPointType::Constructor].first()?.selector)
@@ -118,6 +129,13 @@ impl ContractClassV1 {
             }),
         }
     }
+
+    pub fn try_from_json_string(raw_contract_class: &str) -> Result<ContractClassV1, ProgramError> {
+        let casm_contract_class: CasmContractClass = serde_json::from_str(raw_contract_class)?;
+        let contract_class: ContractClassV1 = casm_contract_class.try_into()?;
+
+        Ok(contract_class)
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -126,12 +144,14 @@ pub struct ContractClassV1Inner {
     pub entry_points_by_type: HashMap<EntryPointType, Vec<EntryPointV1>>,
     pub hints: HashMap<String, Hint>,
 }
+
 #[derive(Debug, Default, Clone, Eq, PartialEq, Hash)]
 pub struct EntryPointV1 {
     pub selector: EntryPointSelector,
     pub offset: EntryPointOffset,
     pub builtins: Vec<String>,
 }
+
 impl EntryPointV1 {
     pub fn pc(&self) -> usize {
         self.offset.0
