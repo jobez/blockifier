@@ -104,7 +104,7 @@ impl CallEntryPoint {
         let storage_address = self.storage_address;
         let storage_class_hash = state.get_class_hash_at(self.storage_address)?;
         if storage_class_hash == ClassHash::default() {
-            log::warn!("error happened in pre execution error uninitialized storage address");
+            log::warn!("err0r happened in pre execution error uninitialized storage address");
             return Err(PreExecutionError::UninitializedStorageAddress(self.storage_address).into());
         }
 
@@ -120,7 +120,7 @@ impl CallEntryPoint {
             |error| match error {
                 // On VM error, pack the stack trace into the propagated error.
                 EntryPointExecutionError::VirtualMachineExecutionError(error) => {
-              log::warn!("virtual machine execution error");      context.error_stack.push((storage_address, error.try_to_vm_trace()));
+                    log::warn!("virtual machine execution error {:?}", error);      context.error_stack.push((storage_address, error.try_to_vm_trace()));
                     // TODO(Dori, 1/5/2023): Call error_trace only in the top call; as it is right
                     // now,  each intermediate VM error is wrapped in a
                     // VirtualMachineExecutionErrorWithTrace  error with the
