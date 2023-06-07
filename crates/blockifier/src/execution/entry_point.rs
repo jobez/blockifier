@@ -138,6 +138,7 @@ impl CallEntryPoint {
             |error| match error {
                 // On VM error, pack the stack trace into the propagated error.
                 EntryPointExecutionError::VirtualMachineExecutionError(error) => {
+                    log::warn!("virtual machine execution error {:?}", error);      
                     context.error_stack.push((storage_address, error.try_to_vm_trace()));
                     // TODO(Dori, 1/5/2023): Call error_trace only in the top call; as it is right
                     // now,  each intermediate VM error is wrapped in a
