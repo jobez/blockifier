@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use cairo_felt::Felt252;
+use cairo_lang_runner::short_string::as_cairo_short_string;
 use cairo_vm::serde::deserialize_program::{
     deserialize_array_of_bigint_hex, Attribute, HintParams, Identifier, ReferenceManager,
 };
@@ -74,11 +75,18 @@ pub fn read_execution_retdata(
     Ok(Retdata(felt_range_from_ptr(&vm, Relocatable::try_from(&retdata_ptr)?, retdata_size)?))
 }
 
-pub fn felt_from_ptr(
+pub fn stark_felt_from_ptr(
     vm: &VirtualMachine,
     ptr: &mut Relocatable,
 ) -> Result<StarkFelt, VirtualMachineError> {
-    let felt = felt_to_stark_felt(vm.get_integer(*ptr)?.as_ref());
+    Ok(felt_to_stark_felt(&felt_from_ptr(vm, ptr)?))
+}
+
+pub fn felt_from_ptr(
+    vm: &VirtualMachine,
+    ptr: &mut Relocatable,
+) -> Result<Felt252, VirtualMachineError> {
+    let felt = vm.get_integer(*ptr)?.into_owned();
     *ptr += 1;
     Ok(felt)
 }
@@ -203,12 +211,20 @@ pub fn execute_deployment(
     )
 }
 
-pub fn write_felt(
+pub fn write_stark_felt(
     vm: &mut VirtualMachine,
     ptr: &mut Relocatable,
     felt: StarkFelt,
 ) -> Result<(), MemoryError> {
-    write_maybe_relocatable(vm, ptr, stark_felt_to_felt(felt))
+    write_felt(vm, ptr, stark_felt_to_felt(felt))
+}
+
+pub fn write_felt(
+    vm: &mut VirtualMachine,
+    ptr: &mut Relocatable,
+    felt: Felt252,
+) -> Result<(), MemoryError> {
+    write_maybe_relocatable(vm, ptr, felt)
 }
 
 pub fn write_maybe_relocatable<T: Into<MaybeRelocatable>>(
@@ -219,4 +235,14 @@ pub fn write_maybe_relocatable<T: Into<MaybeRelocatable>>(
     vm.insert_value(*ptr, value)?;
     *ptr += 1;
     Ok(())
+}
+
+pub fn felts_as_str(felts: &[StarkFelt]) -> String {
+    felts
+        .iter()
+        .map(|felt| {
+            as_cairo_short_string(&stark_felt_to_felt(*felt)).unwrap_or_else(|| felt.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }

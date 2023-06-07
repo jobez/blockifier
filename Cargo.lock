@@ -356,7 +356,12 @@ dependencies = [
  "pretty_assertions",
  "serde",
  "serde_json",
+<<<<<<< HEAD
  "sha3 0.10.8",
+=======
+ "sha3 0.10.7",
+ "starknet-crypto 0.2.0",
+>>>>>>> origin/main
  "starknet_api",
  "strum",
  "strum_macros",
@@ -2108,6 +2113,7 @@ name = "native_blockifier"
 version = "0.1.0"
 dependencies = [
  "blockifier",
+ "cairo-lang-starknet",
  "cairo-vm",
  "hex",
  "indexmap",

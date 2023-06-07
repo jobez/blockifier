@@ -1,12 +1,12 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::sync::Arc;
 
 use blockifier::abi::constants::L1_HANDLER_VERSION;
 use blockifier::block_context::BlockContext;
-use blockifier::execution::contract_class::ContractClass;
+use blockifier::execution::contract_class::{ContractClass, ContractClassV0, ContractClassV1};
 use blockifier::state::cached_state::{CachedState, MutRefState};
-use blockifier::state::state_api::State;
+use blockifier::state::state_api::{State, StateReader};
 use blockifier::transaction::account_transaction::AccountTransaction;
 use blockifier::transaction::objects::AccountTransactionContext;
 use blockifier::transaction::transaction_execution::Transaction;
@@ -20,12 +20,14 @@ use papyrus_storage::db::RO;
 use papyrus_storage::state::StateStorageReader;
 use pyo3::prelude::*;
 use starknet_api::block::{BlockNumber, BlockTimestamp};
-use starknet_api::core::{ClassHash, ContractAddress, EntryPointSelector, Nonce};
+use starknet_api::core::{
+    ClassHash, CompiledClassHash, ContractAddress, EntryPointSelector, Nonce,
+};
 use starknet_api::hash::StarkFelt;
 use starknet_api::transaction::{
-    Calldata, ContractAddressSalt, DeclareTransactionV0V1, DeployAccountTransaction, Fee,
-    InvokeTransaction, InvokeTransactionV0, InvokeTransactionV1, TransactionHash,
-    TransactionSignature, TransactionVersion,
+    Calldata, ContractAddressSalt, DeclareTransactionV0V1, DeclareTransactionV2,
+    DeployAccountTransaction, Fee, InvokeTransaction, InvokeTransactionV0, InvokeTransactionV1,
+    TransactionHash, TransactionSignature, TransactionVersion,
 };
 
 use crate::errors::{NativeBlockifierError, NativeBlockifierInputError, NativeBlockifierResult};
@@ -96,13 +98,29 @@ pub fn py_block_context(
             starknet_os_config,
             "fee_token_address",
         )?)?,
-        vm_resource_fee_cost: py_attr(general_config, "cairo_resource_fee_weights")?,
+        vm_resource_fee_cost: process_cairo_resource_fee_weights(general_config)?,
         gas_price: py_attr(block_info, "gas_price")?,
         invoke_tx_max_n_steps: py_attr(general_config, "invoke_tx_max_n_steps")?,
         validate_max_n_steps: py_attr(general_config, "validate_max_n_steps")?,
     };
 
     Ok(block_context)
+}
+
+fn process_cairo_resource_fee_weights(
+    general_config: &PyAny,
+) -> Result<HashMap<String, f64>, NativeBlockifierError> {
+    let cairo_resource_fee_weights: HashMap<String, f64> =
+        py_attr(general_config, "cairo_resource_fee_weights")?;
+
+    // Remove the suffix "_builtin" from the keys, if exists.
+    // FIXME: This should be fixed in python though...
+    let cairo_resource_fee_weights = cairo_resource_fee_weights
+        .into_iter()
+        .map(|(k, v)| (k.trim_end_matches("_builtin").to_string(), v))
+        .collect();
+
+    Ok(cairo_resource_fee_weights)
 }
 
 pub fn py_declare(
@@ -112,18 +130,43 @@ pub fn py_declare(
     let class_hash = ClassHash(py_felt_attr(tx, "class_hash")?);
 
     let version = usize::try_from(account_data_context.version.0)?;
-    let declare_tx = DeclareTransactionV0V1 {
-        transaction_hash: account_data_context.transaction_hash,
-        max_fee: account_data_context.max_fee,
-        signature: account_data_context.signature,
-        nonce: account_data_context.nonce,
-        class_hash,
-        sender_address: account_data_context.sender_address,
-    };
 
     match version {
-        0 => Ok(starknet_api::transaction::DeclareTransaction::V0(declare_tx)),
-        1 => Ok(starknet_api::transaction::DeclareTransaction::V1(declare_tx)),
+        0 => {
+            let declare_tx = DeclareTransactionV0V1 {
+                transaction_hash: account_data_context.transaction_hash,
+                max_fee: account_data_context.max_fee,
+                signature: account_data_context.signature,
+                nonce: account_data_context.nonce,
+                class_hash,
+                sender_address: account_data_context.sender_address,
+            };
+            Ok(starknet_api::transaction::DeclareTransaction::V0(declare_tx))
+        }
+        1 => {
+            let declare_tx = DeclareTransactionV0V1 {
+                transaction_hash: account_data_context.transaction_hash,
+                max_fee: account_data_context.max_fee,
+                signature: account_data_context.signature,
+                nonce: account_data_context.nonce,
+                class_hash,
+                sender_address: account_data_context.sender_address,
+            };
+            Ok(starknet_api::transaction::DeclareTransaction::V1(declare_tx))
+        }
+        2 => {
+            let compiled_class_hash = CompiledClassHash(py_felt_attr(tx, "compiled_class_hash")?);
+            let declare_tx = DeclareTransactionV2 {
+                transaction_hash: account_data_context.transaction_hash,
+                max_fee: account_data_context.max_fee,
+                signature: account_data_context.signature,
+                nonce: account_data_context.nonce,
+                class_hash,
+                sender_address: account_data_context.sender_address,
+                compiled_class_hash,
+            };
+            Ok(starknet_api::transaction::DeclareTransaction::V2(declare_tx))
+        }
         _ => Err(NativeBlockifierInputError::UnsupportedTransactionVersion {
             tx_type: TransactionType::Declare,
             version,
@@ -195,17 +238,24 @@ pub fn py_tx(
     tx_type: &str,
     tx: &PyAny,
     raw_contract_class: Option<&str>,
-    paid_fee_on_l1: Option<u128>,
 ) -> NativeBlockifierResult<Transaction> {
     match tx_type {
         "DECLARE" => {
+            let tx = py_declare(tx)?;
             let raw_contract_class: &str = raw_contract_class
                 .expect("A contract class must be passed in a Declare transaction.");
-            let contract_class = ContractClass::V0(serde_json::from_str(raw_contract_class)?);
-            let declare_tx = AccountTransaction::Declare(DeclareTransaction {
-                tx: py_declare(tx)?,
-                contract_class,
-            });
+            let contract_class = match tx {
+                starknet_api::transaction::DeclareTransaction::V0(_)
+                | starknet_api::transaction::DeclareTransaction::V1(_) => {
+                    ContractClassV0::try_from_json_string(raw_contract_class)?.into()
+                }
+                starknet_api::transaction::DeclareTransaction::V2(_) => {
+                    ContractClassV1::try_from_json_string(raw_contract_class)?.into()
+                }
+            };
+
+            let declare_tx =
+                AccountTransaction::Declare(DeclareTransaction::new(tx, contract_class)?);
             Ok(Transaction::AccountTransaction(declare_tx))
         }
         "DEPLOY_ACCOUNT" => {
@@ -217,6 +267,7 @@ pub fn py_tx(
             Ok(Transaction::AccountTransaction(invoke_tx))
         }
         "L1_HANDLER" => {
+            let paid_fee_on_l1: Option<u128> = py_attr(tx, "paid_fee_on_l1")?;
             let paid_fee_on_l1 = Fee(paid_fee_on_l1.unwrap_or_default());
             let l1_handler_tx = py_l1_handler(tx)?;
             Ok(Transaction::L1HandlerTransaction(L1HandlerTransaction {
@@ -226,6 +277,17 @@ pub fn py_tx(
         }
         _ => unimplemented!(),
     }
+}
+
+#[pyclass]
+#[derive(Clone)]
+pub struct PyContractClassSizes {
+    #[pyo3(get)]
+    pub bytecode_length: usize,
+    #[pyo3(get)]
+    // For a Cairo 1.0 contract class, builtins are an attribute of an entry point,
+    // and not of the entire class.
+    pub n_builtins: Option<usize>,
 }
 
 #[pyclass]
@@ -306,12 +368,14 @@ impl PyTransactionExecutor {
         &mut self,
         tx: &PyAny,
         raw_contract_class: Option<&str>,
-        paid_fee_on_l1: Option<u128>,
         // This is functools.partial(bouncer.add, tw_written=tx_written).
         enough_room_for_tx: &PyAny,
-    ) -> NativeBlockifierResult<(Py<PyTransactionExecutionInfo>, HashSet<PyFelt>)> {
+    ) -> NativeBlockifierResult<(
+        Py<PyTransactionExecutionInfo>,
+        HashMap<PyFelt, PyContractClassSizes>,
+    )> {
         let tx_type: String = py_enum_name(tx, "tx_type")?;
-        let tx: Transaction = py_tx(&tx_type, tx, raw_contract_class, paid_fee_on_l1)?;
+        let tx: Transaction = py_tx(&tx_type, tx, raw_contract_class)?;
 
         let mut executed_class_hashes = HashSet::<ClassHash>::new();
         self.with_mut(|executor| {
@@ -347,10 +411,10 @@ impl PyTransactionExecutor {
             match has_enough_room_for_tx {
                 Ok(_) => {
                     transactional_state.commit();
-                    let py_executed_compiled_class_hashes = into_py_executed_compiled_class_hashes(
+                    let py_executed_compiled_class_hashes = into_py_contract_class_sizes_mapping(
                         executor.state,
                         executed_class_hashes,
-                    );
+                    )?;
                     Ok((py_tx_execution_info, py_executed_compiled_class_hashes))
                 }
                 // Unexpected error, abort and let caller know.
@@ -361,10 +425,10 @@ impl PyTransactionExecutor {
                 // Not enough room in batch, abort and let caller verify on its own.
                 Err(_not_enough_weight_error) => {
                     transactional_state.abort();
-                    let py_executed_compiled_class_hashes = into_py_executed_compiled_class_hashes(
+                    let py_executed_compiled_class_hashes = into_py_contract_class_sizes_mapping(
                         executor.state,
                         executed_class_hashes,
-                    );
+                    )?;
                     Ok((py_tx_execution_info, py_executed_compiled_class_hashes))
                 }
             }
@@ -387,17 +451,27 @@ fn unexpected_callback_error(error: &PyErr) -> bool {
 }
 
 /// Maps Sierra class hashes to their corresponding compiled class hash.
-pub fn into_py_executed_compiled_class_hashes(
-    _state: &mut CachedState<PapyrusStateReader<'_>>,
+pub fn into_py_contract_class_sizes_mapping(
+    state: &mut CachedState<PapyrusStateReader<'_>>,
     executed_class_hashes: HashSet<ClassHash>,
-) -> HashSet<PyFelt> {
-    let executed_compiled_class_hashes = HashSet::<ClassHash>::new();
+) -> NativeBlockifierResult<HashMap<PyFelt, PyContractClassSizes>> {
+    let mut executed_compiled_class_sizes = HashMap::<PyFelt, PyContractClassSizes>::new();
 
-    for _class_hash in executed_class_hashes {
-        // TODO: understand if this is a Sierra hash; if so, add the corresponding compiled class
-        // hash to set.
-        todo!();
+    for class_hash in executed_class_hashes {
+        let class = state.get_compiled_contract_class(&class_hash)?;
+
+        let sizes = match class {
+            ContractClass::V0(class) => PyContractClassSizes {
+                bytecode_length: class.program.data.len(),
+                n_builtins: Some(class.program.builtins.len()),
+            },
+            ContractClass::V1(class) => {
+                PyContractClassSizes { bytecode_length: class.program.data.len(), n_builtins: None }
+            }
+        };
+
+        executed_compiled_class_sizes.insert(PyFelt::from(class_hash), sizes);
     }
 
-    executed_compiled_class_hashes.iter().map(|class_hash| PyFelt::from(*class_hash)).collect()
+    Ok(executed_compiled_class_sizes)
 }

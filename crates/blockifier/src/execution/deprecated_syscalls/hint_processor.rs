@@ -36,7 +36,7 @@ use crate::execution::entry_point::{
 };
 use crate::execution::errors::EntryPointExecutionError;
 use crate::execution::execution_utils::{
-    felt_from_ptr, felt_range_from_ptr, stark_felt_to_felt, ReadOnlySegment, ReadOnlySegments,
+    felt_range_from_ptr, stark_felt_from_ptr, stark_felt_to_felt, ReadOnlySegment, ReadOnlySegments,
 };
 use crate::execution::hint_code;
 use crate::state::errors::StateError;
@@ -189,6 +189,7 @@ impl<'a> DeprecatedSyscallHintProcessor<'a> {
             }
             DeprecatedSyscallSelector::StorageRead => self.execute_syscall(vm, storage_read),
             DeprecatedSyscallSelector::StorageWrite => self.execute_syscall(vm, storage_write),
+            _ => Err(HintError::UnknownHint(format!("Unsupported syscall selector {selector:?}."))),
         }
     }
 
@@ -246,7 +247,7 @@ impl<'a> DeprecatedSyscallHintProcessor<'a> {
         &mut self,
         vm: &mut VirtualMachine,
     ) -> DeprecatedSyscallResult<StarkFelt> {
-        let selector = felt_from_ptr(vm, &mut self.syscall_ptr)?;
+        let selector = stark_felt_from_ptr(vm, &mut self.syscall_ptr)?;
 
         Ok(selector)
     }
@@ -356,7 +357,7 @@ pub fn read_call_params(
     vm: &VirtualMachine,
     ptr: &mut Relocatable,
 ) -> DeprecatedSyscallResult<(EntryPointSelector, Calldata)> {
-    let function_selector = EntryPointSelector(felt_from_ptr(vm, ptr)?);
+    let function_selector = EntryPointSelector(stark_felt_from_ptr(vm, ptr)?);
     let calldata = read_calldata(vm, ptr)?;
 
     Ok((function_selector, calldata))
@@ -410,7 +411,7 @@ pub fn read_felt_array<TErr>(
 where
     TErr: From<StarknetApiError> + From<VirtualMachineError> + From<MemoryError>,
 {
-    let array_size = felt_from_ptr(vm, ptr)?;
+    let array_size = stark_felt_from_ptr(vm, ptr)?;
     let array_data_start_ptr = vm.get_relocatable(*ptr)?;
     *ptr += 1;
 

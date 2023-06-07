@@ -8,6 +8,7 @@ use starknet_api::hash::StarkFelt;
 use starknet_api::stark_felt;
 
 use super::contract_class::EntryPointV1;
+use super::errors::EntryPointExecutionError;
 use crate::execution::contract_class::ContractClassV1;
 use crate::execution::entry_point::{
     CallEntryPoint, CallExecution, CallInfo, EntryPointExecutionResult, ExecutionContext,
@@ -16,7 +17,7 @@ use crate::execution::errors::{
     PostExecutionError, PreExecutionError, VirtualMachineExecutionError,
 };
 use crate::execution::execution_utils::{
-    read_execution_retdata, stark_felt_to_felt, write_felt, write_maybe_relocatable, Args,
+    read_execution_retdata, stark_felt_to_felt, write_maybe_relocatable, write_stark_felt, Args,
     ReadOnlySegments,
 };
 use crate::execution::syscalls::hint_processor::SyscallHintProcessor;
@@ -71,7 +72,15 @@ pub fn execute_entry_point_call(
         program_segment_size,
     )?;
 
-    Ok(finalize_execution(vm, runner, syscall_handler, previous_vm_resources, n_total_args)?)
+    let call_info =
+        finalize_execution(vm, runner, syscall_handler, previous_vm_resources, n_total_args)?;
+    if call_info.execution.failed {
+        return Err(EntryPointExecutionError::ExecutionFailed {
+            error_data: call_info.execution.retdata.0,
+        });
+    }
+
+    Ok(call_info)
 }
 
 pub fn initialize_execution_context<'a>(
@@ -134,7 +143,7 @@ fn prepare_builtin_costs(
     // additional `ret` statement).
     let mut ptr = (vm.get_pc() + contract_class.program.data.len())?;
     // Push a `ret` opcode.
-    write_felt(vm, &mut ptr, stark_felt!("0x208b7fff7fff7ffe"))?;
+    write_stark_felt(vm, &mut ptr, stark_felt!("0x208b7fff7fff7ffe"))?;
     // Push a pointer to the builtin cost segment.
     write_maybe_relocatable(vm, &mut ptr, builtin_cost_segment_start)?;
 
@@ -167,10 +176,10 @@ pub fn prepare_call_arguments(
             let n_constructed = StarkFelt::default();
             let n_destructed = StarkFelt::default();
             write_maybe_relocatable(vm, &mut ptr, info_segment)?;
-            write_felt(vm, &mut ptr, n_constructed)?;
-            write_felt(vm, &mut ptr, n_destructed)?;
+            write_stark_felt(vm, &mut ptr, n_constructed)?;
+            write_stark_felt(vm, &mut ptr, n_destructed)?;
 
-            args.push(CairoArg::Single(segment_arena.into()));
+            args.push(CairoArg::Single(ptr.into()));
             continue;
         }
         return Err(PreExecutionError::InvalidBuiltin(builtin_name.clone()));
@@ -233,9 +242,15 @@ pub fn finalize_execution(
     syscall_handler.read_only_segments.mark_as_accessed(&mut vm)?;
 
     // Get retdata.
-    // TODO(spapini): Do something with `success`.
-    let [_success, retdata_start, retdata_end]: [MaybeRelocatable; 3] =
+    let [failure_flag, retdata_start, retdata_end]: [MaybeRelocatable; 3] =
         vm.get_return_values(3)?.try_into().expect("Return values must be of size 2.");
+    let failed = if failure_flag == 0.into() {
+        false
+    } else if failure_flag == 1.into() {
+        true
+    } else {
+        return Err(PostExecutionError::MalformedReturnData);
+    };
     let retdata_size = retdata_end.sub(&retdata_start)?;
     // TODO(spapini): Validate implicits.
 
@@ -255,6 +270,9 @@ pub fn finalize_execution(
             retdata: read_execution_retdata(vm, retdata_size, retdata_start)?,
             events: syscall_handler.events,
             l2_to_l1_messages: syscall_handler.l2_to_l1_messages,
+            failed,
+            // TODO(Noa,01/06/2023): Fill with actual values.
+            gas_consumed: StarkFelt::default(),
         },
         vm_resources: full_call_vm_resources.filter_unused_builtins(),
         inner_calls: syscall_handler.inner_calls,
