@@ -119,6 +119,7 @@ impl CallEntryPoint {
         state: &mut dyn State,
         context: &mut ExecutionContext,
     ) -> EntryPointExecutionResult<CallInfo> {
+        println!("execute called");
         // Validate contract is deployed.
         let storage_address = self.storage_address;
         let storage_class_hash = state.get_class_hash_at(self.storage_address)?;
