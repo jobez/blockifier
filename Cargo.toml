@@ -41,3 +41,10 @@ strum = "0.24.1"
 strum_macros = "0.24.3"
 test-case = "2.2.2"
 thiserror = "1.0.37"
+
+[patch."https://github.com/starkware-libs/starknet-api"]
+starknet_api = { git = "https://github.com/dojoengine/starknet-api", branch = "dev" }
+
+[patch.crates-io]
+cairo-felt = { git = "https://github.com/dojoengine/cairo-rs.git", rev = "9edddbc" }
+cairo-vm = { git = "https://github.com/dojoengine/cairo-rs.git", rev = "9edddbc" }
