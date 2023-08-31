@@ -7,7 +7,7 @@ use cairo_vm::hint_processor::builtin_hint_processor::builtin_hint_processor_def
     BuiltinHintProcessor, HintFunc,
 };
 use cairo_vm::hint_processor::builtin_hint_processor::hint_utils::{
-    get_integer_from_var_name, insert_value_from_var_name,
+    get_integer_from_var_name, insert_value_from_var_name, get_ptr_from_var_name
 };
 use cairo_vm::hint_processor::hint_processor_definition::HintReference;
 use cairo_vm::serde::deserialize_program::ApTracking;
@@ -75,9 +75,28 @@ pub fn normalize_address_set_is_250(
     insert_value_from_var_name("is_250", is_250, vm, ids_data, ap_tracking)
 }
 
+/// simple hint example yoinked from https://github.com/lambdaclass/cairo-rs/blob/main/examples/custom_hint/custom_hint.cairo#L4
+pub fn print_opcode_hint(
+    vm: &mut VirtualMachine,
+    exec_scopes: &mut ExecutionScopes,
+    ids_data: &HashMap<String, HintReference>,
+    ap_tracking: &ApTracking,
+    _constants: &HashMap<String, Felt252>,
+) -> Result<(), HintError> {
+    let opcode = get_integer_from_var_name("opcode", vm, ids_data, ap_tracking)?;
+    // eventualy be able to follow the whole execution context
+    let _ctx = get_ptr_from_var_name("ctx", vm, ids_data, ap_tracking)?;
+    println!("opcode: {:X}", opcode.to_biguint());
+    Ok(())
+}
+
 /// Extend the builtin hint processor with common hints.
 pub fn extended_builtin_hint_processor() -> BuiltinHintProcessor {
     let extra_hints: HashMap<String, Rc<HintFunc>> = HashMap::from([
+        (
+            String::from("print(ids.opcode, ids.ctx)"),
+            Rc::new(HintFunc(Box::new(print_opcode_hint))),
+        ),
         (
             NORMALIZE_ADDRESS_SET_IS_SMALL_HINT.to_string(),
             Rc::new(HintFunc(Box::new(normalize_address_set_is_small))),
